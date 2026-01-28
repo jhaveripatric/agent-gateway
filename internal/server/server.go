@@ -12,17 +12,30 @@ import (
 	"github.com/jhaveripatric/agent-gateway/internal/manifest"
 	"github.com/jhaveripatric/agent-gateway/internal/middleware"
 	"github.com/jhaveripatric/agent-gateway/internal/router"
+	"github.com/jhaveripatric/agent-gateway/internal/rpc"
 )
 
 // Server is the HTTP gateway server.
 type Server struct {
-	cfg    *config.Config
-	router chi.Router
+	cfg       *config.Config
+	router    chi.Router
+	rpcClient *rpc.Client
 }
 
 // New creates a new gateway server.
 func New(cfg *config.Config) (*Server, error) {
 	s := &Server{cfg: cfg}
+
+	// Initialize RPC client
+	rpcClient, err := rpc.NewClient(rpc.Config{
+		URL:      cfg.Infrastructure.RabbitMQ.URL,
+		Exchange: cfg.Infrastructure.RabbitMQ.Exchange,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("init rpc client: %w", err)
+	}
+	s.rpcClient = rpcClient
+	log.Printf("Connected to RabbitMQ at %s", cfg.Infrastructure.RabbitMQ.URL)
 
 	if err := s.loadManifests(); err != nil {
 		return nil, err
@@ -64,8 +77,9 @@ func (s *Server) buildRouter(manifests []manifest.Manifest) chi.Router {
 	r.Get("/healthz", s.healthHandler)
 	r.Get("/readyz", s.readyHandler)
 
-	// Mount agent routes
-	agentRoutes := router.BuildRoutes(manifests)
+	// Mount agent routes with RPC
+	builder := router.NewBuilder(s.rpcClient)
+	agentRoutes := builder.Build(manifests)
 	r.Mount("/", agentRoutes)
 
 	return r
@@ -77,8 +91,17 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) readyHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO: Check RabbitMQ connection in Phase 3
 	w.Header().Set("Content-Type", "application/json")
+
+	if !s.rpcClient.Ready() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "not_ready",
+			"reason": "rabbitmq disconnected",
+		})
+		return
+	}
+
 	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 }
 
@@ -87,4 +110,12 @@ func (s *Server) Run() error {
 	addr := fmt.Sprintf(":%d", s.cfg.Gateway.Port)
 	log.Printf("Starting agent-gateway on %s", addr)
 	return http.ListenAndServe(addr, s.router)
+}
+
+// Close shuts down the server and connections.
+func (s *Server) Close() error {
+	if s.rpcClient != nil {
+		return s.rpcClient.Close()
+	}
+	return nil
 }
