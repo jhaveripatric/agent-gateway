@@ -33,6 +33,9 @@ func (l *Loader) Load(path string) (*Manifest, error) {
 		return nil, fmt.Errorf("parse manifest %s: %w", fullPath, err)
 	}
 
+	// Store the manifest path for resolving relative paths
+	manifest.ManifestPath = fullPath
+
 	return manifest, nil
 }
 

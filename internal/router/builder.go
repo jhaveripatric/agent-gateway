@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jhaveripatric/agent-gateway/internal/auth"
 	"github.com/jhaveripatric/agent-gateway/internal/manifest"
 	"github.com/jhaveripatric/agent-gateway/internal/middleware"
 	"github.com/jhaveripatric/agent-gateway/internal/rpc"
@@ -14,12 +15,16 @@ import (
 
 // Builder creates routes from agent manifests.
 type Builder struct {
-	rpc *rpc.Client
+	rpc         *rpc.Client
+	jwtVerifier *auth.JWTVerifier
 }
 
-// NewBuilder creates a route builder with RPC client.
-func NewBuilder(rpcClient *rpc.Client) *Builder {
-	return &Builder{rpc: rpcClient}
+// NewBuilder creates a route builder with RPC client and JWT verifier.
+func NewBuilder(rpcClient *rpc.Client, jwtVerifier *auth.JWTVerifier) *Builder {
+	return &Builder{
+		rpc:         rpcClient,
+		jwtVerifier: jwtVerifier,
+	}
 }
 
 // Build creates routes from agent manifests.
@@ -29,8 +34,12 @@ func (b *Builder) Build(manifests []manifest.Manifest) chi.Router {
 	for _, m := range manifests {
 		for _, action := range m.Actions {
 			pattern := "/api" + action.HTTP.Path
-			log.Printf("Route: %s %s -> %s.%s",
-				action.HTTP.Method, pattern, m.Name, action.Name)
+			authType := "none"
+			if action.Auth != "" {
+				authType = action.Auth
+			}
+			log.Printf("Route: %s %s -> %s.%s (auth: %s)",
+				action.HTTP.Method, pattern, m.Name, action.Name, authType)
 
 			handler := b.buildActionHandler(m, action)
 
@@ -57,7 +66,26 @@ func (b *Builder) buildActionHandler(m manifest.Manifest, action manifest.Action
 		ctx := r.Context()
 		requestID := middleware.GetRequestID(ctx)
 
-		// Parse request body
+		// 1. Authentication (if required)
+		var claims *auth.Claims
+		if action.Auth == "bearer" {
+			token, err := auth.ExtractToken(r)
+			if err != nil {
+				writeError(w, http.StatusUnauthorized, "unauthorized", "Missing or invalid token", requestID)
+				return
+			}
+
+			claims, err = b.jwtVerifier.Verify(token)
+			if err != nil {
+				log.Printf("[%s] JWT verification failed: %v", requestID, err)
+				writeError(w, http.StatusUnauthorized, "unauthorized", "Invalid token", requestID)
+				return
+			}
+
+			ctx = auth.WithClaims(ctx, claims)
+		}
+
+		// 2. Parse request body
 		var data map[string]any
 		if r.Body != nil && r.ContentLength > 0 {
 			if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
@@ -69,11 +97,20 @@ func (b *Builder) buildActionHandler(m manifest.Manifest, action manifest.Action
 			data = make(map[string]any)
 		}
 
-		// Add client info
+		// 3. Add auth context to event data (if authenticated)
+		if claims != nil {
+			data["_auth"] = map[string]any{
+				"user_id":  claims.UserID,
+				"username": claims.Username,
+				"roles":    claims.Roles,
+			}
+		}
+
+		// 4. Add client info
 		data["_client_ip"] = r.RemoteAddr
 		data["_request_id"] = requestID
 
-		// RPC call
+		// 5. RPC call
 		timeout := action.Timeout
 		if timeout == 0 {
 			timeout = 5 * time.Second

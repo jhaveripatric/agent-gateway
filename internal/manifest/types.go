@@ -4,19 +4,21 @@ import "time"
 
 // Manifest represents an agent's capabilities and routes.
 type Manifest struct {
-	Name        string     `yaml:"name"`
-	Version     string     `yaml:"version"`
-	Description string     `yaml:"description"`
-	JWT         *JWTConfig `yaml:"jwt,omitempty"`
-	Actions     []Action   `yaml:"actions"`
+	Name         string     `yaml:"name"`
+	Version      string     `yaml:"version"`
+	Description  string     `yaml:"description"`
+	JWT          *JWTConfig `yaml:"jwt,omitempty"`
+	Actions      []Action   `yaml:"actions"`
+	ManifestPath string     `yaml:"-"` // Set by loader, not from YAML
 }
 
 // JWTConfig holds JWT validation settings.
 type JWTConfig struct {
-	Algorithm string `yaml:"algorithm"`
-	PublicKey string `yaml:"public_key"`
-	Issuer    string `yaml:"issuer"`
-	Audience  string `yaml:"audience"`
+	Algorithm     string `yaml:"algorithm"`
+	PublicKeyPath string `yaml:"public_key_path"`
+	Issuer        string `yaml:"issuer"`
+	Audience      string `yaml:"audience"`
+	KeyID         string `yaml:"key_id"`
 }
 
 // Action represents a single API action.

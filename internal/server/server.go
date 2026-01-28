@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
+	"github.com/jhaveripatric/agent-gateway/internal/auth"
 	"github.com/jhaveripatric/agent-gateway/internal/config"
 	"github.com/jhaveripatric/agent-gateway/internal/manifest"
 	"github.com/jhaveripatric/agent-gateway/internal/middleware"
@@ -17,9 +19,11 @@ import (
 
 // Server is the HTTP gateway server.
 type Server struct {
-	cfg       *config.Config
-	router    chi.Router
-	rpcClient *rpc.Client
+	cfg         *config.Config
+	router      chi.Router
+	rpcClient   *rpc.Client
+	jwtVerifier *auth.JWTVerifier
+	manifests   []manifest.Manifest
 }
 
 // New creates a new gateway server.
@@ -37,7 +41,15 @@ func New(cfg *config.Config) (*Server, error) {
 	s.rpcClient = rpcClient
 	log.Printf("Connected to RabbitMQ at %s", cfg.Infrastructure.RabbitMQ.URL)
 
+	// Initialize JWT verifier
+	s.jwtVerifier = auth.NewJWTVerifier("agenteco", "agent-gateway")
+
 	if err := s.loadManifests(); err != nil {
+		return nil, err
+	}
+
+	// Load public keys from manifests
+	if err := s.loadJWTKeys(); err != nil {
 		return nil, err
 	}
 
@@ -47,7 +59,6 @@ func New(cfg *config.Config) (*Server, error) {
 func (s *Server) loadManifests() error {
 	loader := manifest.NewLoader(".")
 
-	var manifests []manifest.Manifest
 	for _, agent := range s.cfg.Agents {
 		m, err := loader.Load(agent.ManifestPath)
 		if err != nil {
@@ -56,10 +67,39 @@ func (s *Server) loadManifests() error {
 		}
 		log.Printf("Loaded manifest: %s v%s (%d actions)",
 			m.Name, m.Version, len(m.Actions))
-		manifests = append(manifests, *m)
+		s.manifests = append(s.manifests, *m)
 	}
 
-	s.router = s.buildRouter(manifests)
+	s.router = s.buildRouter(s.manifests)
+	return nil
+}
+
+func (s *Server) loadJWTKeys() error {
+	for _, m := range s.manifests {
+		if m.JWT != nil && m.JWT.PublicKeyPath != "" {
+			// Resolve path relative to manifest location
+			keyPath := m.JWT.PublicKeyPath
+			if !filepath.IsAbs(keyPath) {
+				keyPath = filepath.Join(filepath.Dir(m.ManifestPath), keyPath)
+			}
+
+			keyID := m.JWT.KeyID
+			if keyID == "" {
+				keyID = m.Name + "-v1"
+			}
+
+			if err := s.jwtVerifier.LoadPublicKey(keyID, keyPath); err != nil {
+				log.Printf("Warning: failed to load public key for %s: %v", m.Name, err)
+				continue
+			}
+			log.Printf("Loaded public key: %s from %s", keyID, keyPath)
+		}
+	}
+
+	if !s.jwtVerifier.HasKeys() {
+		log.Printf("Warning: no JWT public keys loaded - auth:bearer routes will fail")
+	}
+
 	return nil
 }
 
@@ -77,8 +117,8 @@ func (s *Server) buildRouter(manifests []manifest.Manifest) chi.Router {
 	r.Get("/healthz", s.healthHandler)
 	r.Get("/readyz", s.readyHandler)
 
-	// Mount agent routes with RPC
-	builder := router.NewBuilder(s.rpcClient)
+	// Mount agent routes with RPC and JWT
+	builder := router.NewBuilder(s.rpcClient, s.jwtVerifier)
 	agentRoutes := builder.Build(manifests)
 	r.Mount("/", agentRoutes)
 
